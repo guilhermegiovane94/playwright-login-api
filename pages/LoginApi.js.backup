@@ -1,0 +1,260 @@
+const { chromium } = require('playwright');
+
+class LoginApi {
+  constructor(request, baseURL = '', options = {}) {
+    this.request = request;
+    this.baseURL = baseURL;
+    this.endpoint = '/api/login';
+    this.maxRetries = options.maxRetries || 8;
+    this.retryDelay = options.retryDelay || 8000;
+    this.useBrowserFetch = options.useBrowserFetch || false; // Usar fetch nativo do navegador real
+    this._browser = null;
+    this._context = null;
+    this._page = null;
+  }
+
+  /**
+   * Aguarda um período específico antes de tentar novamente
+   * @param {number} ms - Milissegundos para aguardar
+   */
+  async sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Garante que um navegador real (Chromium) esteja disponível para fetch via page.evaluate
+   * @private
+   */
+  async _ensureBrowser() {
+    if (this._page) return;
+    this._browser = await chromium.launch({ headless: true });
+    this._context = await this._browser.newContext({
+      userAgent:
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      viewport: { width: 1920, height: 1080 },
+      locale: 'pt-BR',
+      timezoneId: 'America/Sao_Paulo',
+    });
+    this._page = await this._context.newPage();
+  }
+
+  /**
+   * Executa fetch nativo do navegador via page.evaluate
+   * @param {string} url - URL completa
+   * @param {Object} data - Payload JSON
+   * @returns {Object} Objeto compatível com a interface de resposta do Playwright
+   * @private
+   */
+  async _fetchViaBrowser(url, data) {
+    await this._ensureBrowser();
+
+    const result = await this._page.evaluate(
+      async ({ url, data }) => {
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+          },
+          body: JSON.stringify(data),
+          credentials: 'omit',
+        });
+        let body = {};
+        try {
+          body = await response.json();
+        } catch (_) {
+          body = {};
+        }
+        const headers = {};
+        response.headers.forEach((value, key) => {
+          headers[key] = value;
+        });
+        return {
+          status: response.status,
+          statusText: response.statusText,
+          headers,
+          body,
+          ok: response.ok,
+        };
+      },
+      { url, data }
+    );
+
+    // Adapta para interface semelhante ao APIResponse do Playwright
+    return {
+      status: () => result.status,
+      json: async () => result.body,
+      headers: () => result.headers,
+      body: result.body,
+    };
+  }
+
+  /**
+   * Extrai informações de rate limit (reset) do corpo da resposta 429.
+   * A ReqRes retorna campos como `resets_in` (texto) e `reset_at` (timestamp Unix).
+   * @param {Object} response - Resposta da API
+   * @returns {{ resetsIn: string|null, resetAt: number|null, timeRemainingMs: number|null }}
+   * @private
+   */
+  _getRateLimitResetInfo(response) {
+    try {
+      const body = response.body || {};
+      const resetsIn = body.resets_in || null;
+      const resetAt = body.reset_at || null;
+
+      let timeRemainingMs = null;
+      if (resetAt) {
+        const nowMs = Date.now();
+        const resetAtMs = Number(resetAt) * 1000; // reset_at vem em segundos
+        timeRemainingMs = Math.max(0, resetAtMs - nowMs);
+      }
+
+      return { resetsIn, resetAt, timeRemainingMs };
+    } catch (_) {
+      return { resetsIn: null, resetAt: null, timeRemainingMs: null };
+    }
+  }
+
+  /**
+   * Formata milissegundos em string legível (ex: "2h 15m 30s").
+   * @param {number|null} ms - Milissegundos
+   * @returns {string}
+   * @private
+   */
+  _formatMsToHuman(ms) {
+    if (!ms || ms <= 0) return 'indeterminado';
+    const totalSeconds = Math.floor(ms / 1000);
+    const h = Math.floor(totalSeconds / 3600);
+    const m = Math.floor((totalSeconds % 3600) / 60);
+    const s = totalSeconds % 60;
+    const parts = [];
+    if (h > 0) parts.push(`${h}h`);
+    if (m > 0) parts.push(`${m}m`);
+    if (s > 0 || parts.length === 0) parts.push(`${s}s`);
+    return parts.join(' ');
+  }
+
+  /**
+   * Envia uma requisição POST para o endpoint de login com retry automático
+   * @param {Object} userData - Dados do usuário (email, password)
+   * @param {Object} options - opções extras (ex: useBrowserFetch para forçar navegador real)
+   * @returns {APIResponse} Resposta da API
+   */
+  async login(userData, options = {}) {
+    let lastResponse;
+    let lastRateLimitInfo = null;
+    const url = this.baseURL ? `${this.baseURL}${this.endpoint}` : this.endpoint;
+    const useBrowserFetch =
+      options.useBrowserFetch !== undefined ? options.useBrowserFetch : this.useBrowserFetch;
+
+    const maxRetries = options.maxRetries ?? this.maxRetries;
+    const baseDelay = options.retryDelay ?? this.retryDelay;
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      const startTime = Date.now();
+      let response;
+
+      if (useBrowserFetch) {
+        response = await this._fetchViaBrowser(url, userData);
+      } else if (this.request) {
+        response = await this.request.post(url, {
+          data: userData,
+        });
+      } else {
+        throw new Error(
+          'Nenhum contexto de requisição disponível. Passe request no construtor ou defina useBrowserFetch: true.'
+        );
+      }
+
+      const duration = Date.now() - startTime;
+      response.duration = duration;
+
+      const status = response.status();
+
+      if (status !== 429) {
+        return response;
+      }
+
+      lastResponse = response;
+
+      // Extrai informações de reset do corpo da resposta 429
+      lastRateLimitInfo = this._getRateLimitResetInfo(response);
+
+      if (attempt === maxRetries) break;
+
+      let waitMs = baseDelay * Math.pow(2, attempt - 1);
+
+      const headers = response.headers();
+      const retryAfter = headers['retry-after'] || headers['Retry-After'];
+      if (retryAfter) {
+        const seconds = parseInt(retryAfter, 10);
+        if (!isNaN(seconds) && seconds > 0) {
+          waitMs = Math.max(waitMs, seconds * 1000);
+        }
+      }
+
+      const jitter = waitMs * 0.3 * (Math.random() * 2 - 1);
+      waitMs = Math.max(1000, Math.round(waitMs + jitter));
+
+      const resetInfoStr = lastRateLimitInfo
+        ? ` | Reset da API em ${this._formatMsToHuman(lastRateLimitInfo.timeRemainingMs)}`
+        : '';
+      console.log(
+        `[LoginApi] 429 (tentativa ${attempt}/${maxRetries}). Aguardando ${waitMs} ms...${resetInfoStr}`
+      );
+      await this.sleep(waitMs);
+    }
+
+    const resetInfoStr = lastRateLimitInfo
+      ? `\n   → Tempo restante para reset da API: ${this._formatMsToHuman(
+          lastRateLimitInfo.timeRemainingMs
+        )}` +
+        (lastRateLimitInfo.resetsIn ? ` (informado pela API: ${lastRateLimitInfo.resetsIn})` : '')
+      : '';
+
+    throw new Error(
+      `Rate limit (429) persistente após ${maxRetries} tentativas.${resetInfoStr} ` +
+      `Use uma API key gratuita (app.reqres.in) ou aumente o intervalo entre testes.`
+    );
+  }
+
+  /**
+   * Fecha o navegador caso tenha sido criado por esta instância
+   */
+  async close() {
+    if (this._browser) {
+      await this._browser.close();
+      this._browser = null;
+      this._context = null;
+      this._page = null;
+    }
+  }
+
+  /**
+   * Validações reutilizáveis para resposta de sucesso
+   * @param {Object} body - Corpo da resposta JSON
+   * @returns {boolean}
+   */
+  validateSuccessBody(body) {
+    if (!body || typeof body.token !== 'string' || body.token.length === 0) {
+      throw new Error('Corpo de resposta inválido: token não encontrado ou vazio.');
+    }
+    return true;
+  }
+
+  /**
+   * Validações reutilizáveis para resposta de erro
+   * @param {Object} body - Corpo da resposta JSON
+   * @returns {boolean}
+   */
+  validateErrorBody(body) {
+    if (!body || typeof body.error !== 'string' || body.error.length === 0) {
+      throw new Error(
+        'Corpo de resposta inválido: propriedade error não encontrada ou vazia.'
+      );
+    }
+    return true;
+  }
+}
+
+module.exports = { LoginApi };

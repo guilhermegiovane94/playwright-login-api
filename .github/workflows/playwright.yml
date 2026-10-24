@@ -1,0 +1,27 @@
+name: Playwright Login API Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  playwright-run:
+    runs-on: ubuntu-latest
+    env:
+      REQRES_API_KEY: ${{ secrets.REQRES_API_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run Playwright tests
+        run: npm test

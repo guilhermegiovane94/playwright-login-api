@@ -1,0 +1,25 @@
+{
+  "name": "playwright-login-api",
+  "version": "1.0.0",
+  "description": "Projeto Playwright - Validação de Login (Backend Only)",
+  "main": "index.js",
+  "scripts": {
+    "test": "playwright test",
+    "test:ui": "playwright test --ui",
+    "test:headed": "playwright test --headed",
+    "test:debug": "playwright test --debug",
+    "install:browsers": "playwright install"
+  },
+  "keywords": [
+    "playwright",
+    "api",
+    "login",
+    "backend",
+    "automation"
+  ],
+  "author": "Guilherme Giovane",
+  "license": "MIT",
+  "devDependencies": {
+    "@playwright/test": "^1.45.0"
+  }
+}
